@@ -41,10 +41,15 @@ import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.NumberPicker;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import com.aicodix.rattlegram.databinding.ActivityMainBinding;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
+import java.security.spec.KeySpec;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -52,6 +57,13 @@ import java.util.Date;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
+
+import javax.crypto.Cipher;
+import javax.crypto.SecretKey;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.PBEKeySpec;
+import javax.crypto.spec.SecretKeySpec;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -112,6 +124,63 @@ public class MainActivity extends AppCompatActivity {
 	private byte[] stagedCall;
 	private String callSign;
 	private String draftText;
+	private String password;
+
+	private void setPassword() {
+		View view = getLayoutInflater().inflate(R.layout.set_password, null);
+		EditText passwordText = view.findViewById(R.id.password);
+		AlertDialog.Builder builder = new AlertDialog.Builder(this, R.style.Theme_AlertDialog);
+		builder.setTitle(R.string.change_password);
+		builder.setView(view);
+		builder.setPositiveButton(R.string.okay, (dialog, which) -> {
+			this.password = passwordText.getText().toString();
+			storeSettings();
+			addString(getString(R.string.password_changed));
+		});
+		builder.setNegativeButton(R.string.cancel, null);
+		builder.show();
+	}
+
+	private IvParameterSpec generateIv() {
+		byte[] iv = new byte[16];
+		new SecureRandom().nextBytes(iv);
+		return new IvParameterSpec(iv);
+	}
+
+	private SecretKey getKeyDerivation(String text) throws Exception {
+		SecretKeyFactory factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
+		KeySpec spec = new PBEKeySpec(text.toCharArray(), text.getBytes(), 2048, 256);
+		return new SecretKeySpec(factory.generateSecret(spec).getEncoded(), "AES");
+	}
+
+	private byte[] encryptText(String text) throws Exception {
+		IvParameterSpec iv = generateIv();
+		Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5PADDING");
+		cipher.init(Cipher.ENCRYPT_MODE, getKeyDerivation(password), iv);
+		byte[] finalBytes = cipher.doFinal(text.getBytes(StandardCharsets.UTF_8));
+
+		ByteArrayOutputStream output = new ByteArrayOutputStream();
+		output.write(iv.getIV());
+		output.write((byte) finalBytes.length);
+		output.write(finalBytes);
+		return output.toByteArray();
+	}
+
+	private byte[] decryptText(byte[] data) throws Exception {
+		ByteArrayInputStream input = new ByteArrayInputStream(data);
+		IvParameterSpec iv = new IvParameterSpec(input.readNBytes(16));
+		int length = input.read();
+
+		// AES/CBC/PKCS5PADDING is expected to be 16-byte aligned
+		if (length <= 0 || length % 16 != 0)
+			throw new Exception("Invalid length");
+
+		data = input.readNBytes(length);
+
+		Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5PADDING");
+		cipher.init(Cipher.DECRYPT_MODE, getKeyDerivation(password), iv);
+		return cipher.doFinal(data);
+	}
 
 	private native boolean createEncoder(int sampleRate);
 
@@ -235,10 +304,20 @@ public class MainActivity extends AppCompatActivity {
 						addLine(new String(stagedCall).trim(), getString(R.string.decoding_failed));
 					} else {
 						setStatus(getResources().getQuantityString(R.plurals.bits_flipped, result, result), true);
-						if (repeaterMode)
+						if (repeaterMode) {
 							repeatMessage();
-						else
-							addMessage(new String(stagedCall).trim(), getString(R.string.received), new String(payload).trim());
+						} else {
+							try {
+								// make sure NOT to overwrite the previous "payload", because doing so
+								// will cause the size of "payload" to be different than expected
+								byte[] newPayload = decryptText(payload);
+								addMessage(new String(stagedCall).trim(), getString(R.string.received), new String(newPayload).trim());
+							} catch (Exception e) {
+								// show the original message even if decryption fails (maybe it wasn't encrypted)
+								addMessage(new String(stagedCall).trim(), getString(R.string.received_decrypt_failed), new String(payload).trim());
+								return;
+							}
+						}
 					}
 					break;
 			}
@@ -401,6 +480,7 @@ public class MainActivity extends AppCompatActivity {
 		state.putString("draftText", draftText);
 		state.putBoolean("fancyHeader", fancyHeader);
 		state.putBoolean("repeaterMode", repeaterMode);
+		state.putString("password", password);
 		for (int i = 0; i < messages.getCount(); ++i)
 			state.putString("m" + i, messages.getItem(i));
 		super.onSaveInstanceState(state);
@@ -423,6 +503,7 @@ public class MainActivity extends AppCompatActivity {
 		edit.putString("draftText", draftText);
 		edit.putBoolean("fancyHeader", fancyHeader);
 		edit.putBoolean("repeaterMode", repeaterMode);
+		edit.putString("password", password);
 		for (int i = 0; i < messages.getCount(); ++i)
 			edit.putString("m" + i, messages.getItem(i));
 		edit.apply();
@@ -442,6 +523,7 @@ public class MainActivity extends AppCompatActivity {
 		final String defaultDraftText = "";
 		final boolean defaultFancyHeader = false;
 		final boolean defaultRepeaterMode = false;
+		final String defaultPassword = "password";
 		if (state == null) {
 			SharedPreferences pref = getPreferences(Context.MODE_PRIVATE);
 			AppCompatDelegate.setDefaultNightMode(pref.getInt("nightMode", AppCompatDelegate.getDefaultNightMode()));
@@ -458,6 +540,7 @@ public class MainActivity extends AppCompatActivity {
 			draftText = pref.getString("draftText", defaultDraftText);
 			fancyHeader = pref.getBoolean("fancyHeader", defaultFancyHeader);
 			repeaterMode = pref.getBoolean("repeaterMode", defaultRepeaterMode);
+			password = pref.getString("password", defaultPassword);
 			for (int i = 0; i < 100; ++i) {
 				String mesg = pref.getString("m" + i, null);
 				if (mesg != null)
@@ -478,6 +561,7 @@ public class MainActivity extends AppCompatActivity {
 			draftText = state.getString("draftText", defaultDraftText);
 			fancyHeader = state.getBoolean("fancyHeader", defaultFancyHeader);
 			repeaterMode = state.getBoolean("repeaterMode", defaultRepeaterMode);
+			password = state.getString("password", defaultPassword);
 			for (int i = 0; i < 100; ++i) {
 				String mesg = state.getString("m" + i, null);
 				if (mesg != null)
@@ -1023,6 +1107,10 @@ public class MainActivity extends AppCompatActivity {
 			forcedQuit();
 			return true;
 		}
+		if (id == R.id.action_password) {
+			setPassword();
+			return true;
+		}
 		if (id == R.id.action_privacy_policy) {
 			showTextPage(getString(R.string.privacy_policy), getString(R.string.privacy_policy_text));
 			return true;
@@ -1157,11 +1245,17 @@ public class MainActivity extends AppCompatActivity {
 
 	private void transmitMessage(String message) {
 		stopListening();
-		byte[] mesg = Arrays.copyOf(message.getBytes(StandardCharsets.UTF_8), payload.length);
+		byte[] mesg = null;
+		try {
+			mesg = encryptText(message);
+		} catch (Exception e) {
+			Toast.makeText(this, e.getMessage(), Toast.LENGTH_LONG).show();
+			return;
+		}
 		if (message.length() == 0)
 			addLine(callSign.trim(), getString(R.string.sent_ping));
 		else
-			addMessage(callSign.trim(), getString(R.string.transmitted), new String(mesg).trim());
+			addMessage(callSign.trim(), getString(R.string.transmitted), message);
 		configureEncoder(mesg, callTerm(), carrierFrequency, noiseSymbols, fancyHeader);
 		for (int i = 0; i < 5; ++i) {
 			produceEncoder(outputBuffer, outputChannel);

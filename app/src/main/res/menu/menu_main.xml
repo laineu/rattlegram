@@ -15,6 +15,9 @@
 		android:title="@string/compose"
 		app:iconTint="@color/tint"
 		app:showAsAction="always" />
+	<item
+		android:id="@+id/action_password"
+		android:title="@string/change_password" />
 	<item android:title="@string/encoder_settings">
 		<menu>
 			<item android:title="@string/sample_rate">
