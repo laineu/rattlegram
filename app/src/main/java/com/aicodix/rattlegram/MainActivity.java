@@ -18,7 +18,6 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
-import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.media.AudioFormat;
 import android.media.AudioManager;
@@ -28,7 +27,6 @@ import android.media.MediaRecorder;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
-import android.os.SystemClock;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
@@ -38,7 +36,6 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ArrayAdapter;
 import android.widget.EditText;
-import android.widget.ImageView;
 import android.widget.NumberPicker;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -47,6 +44,7 @@ import com.aicodix.rattlegram.databinding.ActivityMainBinding;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.security.spec.KeySpec;
@@ -54,7 +52,6 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 
@@ -72,38 +69,13 @@ public class MainActivity extends AppCompatActivity {
 		System.loadLibrary("rattlegram");
 	}
 
-	private static class Message {
-		public long time;
-		public byte[] call;
-		public byte[] data;
-
-		public Message(byte[] call, byte[] data) {
-			this.time = SystemClock.elapsedRealtime() / 1000;
-			this.call = Arrays.copyOf(call, 10);
-			this.data = Arrays.copyOf(data, 170);
-		}
-	}
-	private ArrayList<Message> repeatedMessages;
-
 	private final int permissionID = 1;
 	private final int audioFormat = AudioFormat.ENCODING_PCM_16BIT;
 	private final int sampleSize = 2;
-	private final int spectrumWidth = 360, spectrumHeight = 128;
-	private final int spectrogramWidth = 360, spectrogramHeight = 128;
-	private Bitmap spectrumBitmap, spectrogramBitmap;
-	private int[] spectrumPixels, spectrogramPixels;
-	private ImageView spectrumView, spectrogramView;
 	private TextView status;
 	private AudioRecord audioRecord;
 	private AudioTrack audioTrack;
-	private boolean fancyHeader;
-	private boolean repeaterMode;
-	private boolean showSpectrum;
-	private boolean ultrasonicEnabled;
-	private int spectrumTint;
 	private int noiseSymbols;
-	private int repeaterDelay;
-	private int repeaterDebounce;
 	private int recordRate;
 	private int outputRate;
 	private int recordChannel;
@@ -125,6 +97,9 @@ public class MainActivity extends AppCompatActivity {
 	private String callSign;
 	private String draftText;
 	private String password;
+	// IV (16) + length (1) + data (variable), limited to 170 bytes
+	private final int MAX_MESSAGE_SIZE_AES = (int) Math.floor(170.f / 16.f) * 16;
+	private final int MAX_CHARACTERS = MAX_MESSAGE_SIZE_AES - (16 + 1);
 
 	private void setPassword() {
 		View view = getLayoutInflater().inflate(R.layout.set_password, null);
@@ -166,16 +141,24 @@ public class MainActivity extends AppCompatActivity {
 		return output.toByteArray();
 	}
 
+	// InputStream.readNBytes requires API level 33
+	private byte[] readN(InputStream input, int n) throws Exception {
+		byte[] temp = new byte[n];
+		if (input.read(temp) != n)
+			throw new Exception("Invalid data");
+		return temp;
+	}
+
 	private byte[] decryptText(byte[] data) throws Exception {
 		ByteArrayInputStream input = new ByteArrayInputStream(data);
-		IvParameterSpec iv = new IvParameterSpec(input.readNBytes(16));
+		IvParameterSpec iv = new IvParameterSpec(readN(input, 16));
 		int length = input.read();
 
 		// AES/CBC/PKCS5PADDING is expected to be 16-byte aligned
 		if (length <= 0 || length % 16 != 0)
 			throw new Exception("Invalid length");
 
-		data = input.readNBytes(length);
+		data = readN(input, length);
 
 		Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5PADDING");
 		cipher.init(Cipher.DECRYPT_MODE, getKeyDerivation(password), iv);
@@ -238,8 +221,6 @@ public class MainActivity extends AppCompatActivity {
 
 	private native int processDecoder();
 
-	private native void spectrumDecoder(int[] spectrumPixels, int[] spectrogramPixels, int spectrumTint);
-
 	private native void stagedDecoder(float[] carrierFrequencyOffset, int[] operationMode, byte[] callSign);
 
 	private native int fetchDecoder(byte[] payload);
@@ -260,20 +241,13 @@ public class MainActivity extends AppCompatActivity {
 			if (!feedDecoder(recordBuffer, recordCount, recordChannel))
 				return;
 			int status = processDecoder();
-			if (showSpectrum) {
-				spectrumDecoder(spectrumPixels, spectrogramPixels, spectrumTint);
-				spectrumBitmap.setPixels(spectrumPixels, 0, spectrumWidth, 0, 0, spectrumWidth, spectrumHeight);
-				spectrogramBitmap.setPixels(spectrogramPixels, 0, spectrogramWidth, 0, 0, spectrogramWidth, spectrogramHeight);
-				spectrumView.invalidate();
-				spectrogramView.invalidate();
-			}
 			final int STATUS_OKAY = 0;
 			final int STATUS_FAIL = 1;
 			final int STATUS_SYNC = 2;
 			final int STATUS_DONE = 3;
 			final int STATUS_HEAP = 4;
 			final int STATUS_NOPE = 5;
-			final int STATUS_PING = 6;
+			// final int STATUS_PING = 6;
 			switch (status) {
 				case STATUS_OKAY:
 					break;
@@ -285,11 +259,13 @@ public class MainActivity extends AppCompatActivity {
 					fromStatus();
 					addLine(new String(stagedCall).trim(), getString(R.string.preamble_nope, stagedMode[0]));
 					break;
+				/* ping is encrypted as well
 				case STATUS_PING:
 					stagedDecoder(stagedCFO, stagedMode, stagedCall);
 					fromStatus();
 					addLine(new String(stagedCall).trim(), getString(R.string.preamble_ping));
 					break;
+				 */
 				case STATUS_HEAP:
 					setStatus(getString(R.string.heap_error));
 					audioRecord.stop();
@@ -304,19 +280,22 @@ public class MainActivity extends AppCompatActivity {
 						addLine(new String(stagedCall).trim(), getString(R.string.decoding_failed));
 					} else {
 						setStatus(getResources().getQuantityString(R.plurals.bits_flipped, result, result), true);
-						if (repeaterMode) {
-							repeatMessage();
-						} else {
-							try {
-								// make sure NOT to overwrite the previous "payload", because doing so
-								// will cause the size of "payload" to be different than expected
-								byte[] newPayload = decryptText(payload);
+						try {
+							// make sure NOT to overwrite the previous "payload", because doing so
+							// will cause the size of "payload" to be different than expected
+							byte[] newPayload = decryptText(payload);
+							if (newPayload.length > 0) {
+								// show the decrypted message
 								addMessage(new String(stagedCall).trim(), getString(R.string.received), new String(newPayload).trim());
-							} catch (Exception e) {
-								// show the original message even if decryption fails (maybe it wasn't encrypted)
-								addMessage(new String(stagedCall).trim(), getString(R.string.received_decrypt_failed), new String(payload).trim());
-								return;
+							} else {
+								// empty is a ping
+								addLine(new String(stagedCall).trim(), getString(R.string.preamble_ping));
 							}
+						} catch (Exception e) {
+							// show the original message even if decryption fails (maybe it wasn't encrypted)
+							// TODO: add a way to decrypt it with another password?
+							addMessage(new String(stagedCall).trim(), getString(R.string.received_decrypt_failed), new String(payload).trim());
+							return;
 						}
 					}
 					break;
@@ -466,7 +445,6 @@ public class MainActivity extends AppCompatActivity {
 
 	@Override
 	protected void onSaveInstanceState(@NonNull Bundle state) {
-		state.putInt("nightMode", AppCompatDelegate.getDefaultNightMode());
 		state.putInt("outputRate", outputRate);
 		state.putInt("outputChannel", outputChannel);
 		state.putInt("recordRate", recordRate);
@@ -474,12 +452,8 @@ public class MainActivity extends AppCompatActivity {
 		state.putInt("audioSource", audioSource);
 		state.putInt("carrierFrequency", carrierFrequency);
 		state.putInt("noiseSymbols", noiseSymbols);
-		state.putInt("repeaterDelay", repeaterDelay);
-		state.putInt("repeaterDebounce", repeaterDebounce);
 		state.putString("callSign", callSign);
 		state.putString("draftText", draftText);
-		state.putBoolean("fancyHeader", fancyHeader);
-		state.putBoolean("repeaterMode", repeaterMode);
 		state.putString("password", password);
 		for (int i = 0; i < messages.getCount(); ++i)
 			state.putString("m" + i, messages.getItem(i));
@@ -489,7 +463,6 @@ public class MainActivity extends AppCompatActivity {
 	private void storeSettings() {
 		SharedPreferences pref = getPreferences(Context.MODE_PRIVATE);
 		SharedPreferences.Editor edit = pref.edit();
-		edit.putInt("nightMode", AppCompatDelegate.getDefaultNightMode());
 		edit.putInt("outputRate", outputRate);
 		edit.putInt("outputChannel", outputChannel);
 		edit.putInt("recordRate", recordRate);
@@ -497,12 +470,8 @@ public class MainActivity extends AppCompatActivity {
 		edit.putInt("audioSource", audioSource);
 		edit.putInt("carrierFrequency", carrierFrequency);
 		edit.putInt("noiseSymbols", noiseSymbols);
-		edit.putInt("repeaterDelay", repeaterDelay);
-		edit.putInt("repeaterDebounce", repeaterDebounce);
 		edit.putString("callSign", callSign);
 		edit.putString("draftText", draftText);
-		edit.putBoolean("fancyHeader", fancyHeader);
-		edit.putBoolean("repeaterMode", repeaterMode);
 		edit.putString("password", password);
 		for (int i = 0; i < messages.getCount(); ++i)
 			edit.putString("m" + i, messages.getItem(i));
@@ -517,16 +486,12 @@ public class MainActivity extends AppCompatActivity {
 		final int defaultAudioSource = MediaRecorder.AudioSource.DEFAULT;
 		final int defaultCarrierFrequency = 1500;
 		final int defaultNoiseSymbols = 6;
-		final int defaultRepeaterDelay = 1;
-		final int defaultRepeaterDebounce = 60;
 		final String defaultCallSign = "ANONYMOUS";
 		final String defaultDraftText = "";
-		final boolean defaultFancyHeader = false;
-		final boolean defaultRepeaterMode = false;
 		final String defaultPassword = "password";
 		if (state == null) {
 			SharedPreferences pref = getPreferences(Context.MODE_PRIVATE);
-			AppCompatDelegate.setDefaultNightMode(pref.getInt("nightMode", AppCompatDelegate.getDefaultNightMode()));
+			AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.getDefaultNightMode());
 			outputRate = pref.getInt("outputRate", defaultSampleRate);
 			outputChannel = pref.getInt("outputChannel", defaultChannelSelect);
 			recordRate = pref.getInt("recordRate", defaultSampleRate);
@@ -534,12 +499,8 @@ public class MainActivity extends AppCompatActivity {
 			audioSource = pref.getInt("audioSource", defaultAudioSource);
 			carrierFrequency = pref.getInt("carrierFrequency", defaultCarrierFrequency);
 			noiseSymbols = pref.getInt("noiseSymbols", defaultNoiseSymbols);
-			repeaterDelay = pref.getInt("repeaterDelay", defaultRepeaterDelay);
-			repeaterDebounce = pref.getInt("repeaterDebounce", defaultRepeaterDebounce);
 			callSign = pref.getString("callSign", defaultCallSign);
 			draftText = pref.getString("draftText", defaultDraftText);
-			fancyHeader = pref.getBoolean("fancyHeader", defaultFancyHeader);
-			repeaterMode = pref.getBoolean("repeaterMode", defaultRepeaterMode);
 			password = pref.getString("password", defaultPassword);
 			for (int i = 0; i < 100; ++i) {
 				String mesg = pref.getString("m" + i, null);
@@ -547,7 +508,7 @@ public class MainActivity extends AppCompatActivity {
 					messages.add(mesg);
 			}
 		} else {
-			AppCompatDelegate.setDefaultNightMode(state.getInt("nightMode", AppCompatDelegate.getDefaultNightMode()));
+			AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.getDefaultNightMode());
 			outputRate = state.getInt("outputRate", defaultSampleRate);
 			outputChannel = state.getInt("outputChannel", defaultChannelSelect);
 			recordRate = state.getInt("recordRate", defaultSampleRate);
@@ -555,12 +516,8 @@ public class MainActivity extends AppCompatActivity {
 			audioSource = state.getInt("audioSource", defaultAudioSource);
 			carrierFrequency = state.getInt("carrierFrequency", defaultCarrierFrequency);
 			noiseSymbols = state.getInt("noiseSymbols", defaultNoiseSymbols);
-			repeaterDelay = state.getInt("repeaterDelay", defaultRepeaterDelay);
-			repeaterDebounce = state.getInt("repeaterDebounce", defaultRepeaterDebounce);
 			callSign = state.getString("callSign", defaultCallSign);
 			draftText = state.getString("draftText", defaultDraftText);
-			fancyHeader = state.getBoolean("fancyHeader", defaultFancyHeader);
-			repeaterMode = state.getBoolean("repeaterMode", defaultRepeaterMode);
 			password = state.getString("password", defaultPassword);
 			for (int i = 0; i < 100; ++i) {
 				String mesg = state.getString("m" + i, null);
@@ -568,7 +525,6 @@ public class MainActivity extends AppCompatActivity {
 					messages.add(mesg);
 			}
 		}
-		ultrasonicEnabled = Math.abs(carrierFrequency) > 3000;
 		super.onCreate(state);
 		ActivityMainBinding binding = ActivityMainBinding.inflate(getLayoutInflater());
 		status = binding.status;
@@ -578,7 +534,6 @@ public class MainActivity extends AppCompatActivity {
 		stagedMode = new int[1];
 		stagedCall = new byte[10];
 		payload = new byte[170];
-		repeatedMessages = new ArrayList<>();
 		binding.messages.setAdapter(messages);
 		binding.messages.setOnItemClickListener((adapterView, view, i, l) -> {
 			String item = messages.getItem(i);
@@ -664,89 +619,6 @@ public class MainActivity extends AppCompatActivity {
 				menu.findItem(R.id.action_set_noise_four_seconds).setChecked(true);
 				break;
 		}
-	}
-
-	private void setRepeaterDelay(int newRepeaterDelay) {
-		if (repeaterDelay == newRepeaterDelay)
-			return;
-		repeaterDelay = newRepeaterDelay;
-		updateRepeaterDelayMenu();
-	}
-
-	private void updateRepeaterDelayMenu() {
-		switch (repeaterDelay) {
-			case 0:
-				menu.findItem(R.id.action_set_repeater_no_delay).setChecked(true);
-				break;
-			case 1:
-				menu.findItem(R.id.action_set_repeater_delay_one_second).setChecked(true);
-				break;
-			case 2:
-				menu.findItem(R.id.action_set_repeater_delay_two_seconds).setChecked(true);
-				break;
-			case 4:
-				menu.findItem(R.id.action_set_repeater_delay_four_seconds).setChecked(true);
-				break;
-			case 8:
-				menu.findItem(R.id.action_set_repeater_delay_eight_seconds).setChecked(true);
-				break;
-		}
-	}
-
-
-	private void setRepeaterDebounce(int newRepeaterDebounce) {
-		if (repeaterDebounce == newRepeaterDebounce)
-			return;
-		repeaterDebounce = newRepeaterDebounce;
-		updateRepeaterDebounceMenu();
-	}
-
-	private void updateRepeaterDebounceMenu() {
-		switch (repeaterDebounce) {
-			case 0:
-				menu.findItem(R.id.action_set_repeater_allow_bouncing).setChecked(true);
-				break;
-			case 15:
-				menu.findItem(R.id.action_set_repeater_debounce_quarter_minute).setChecked(true);
-				break;
-			case 30:
-				menu.findItem(R.id.action_set_repeater_debounce_half_minute).setChecked(true);
-				break;
-			case 60:
-				menu.findItem(R.id.action_set_repeater_debounce_one_minute).setChecked(true);
-				break;
-			case 120:
-				menu.findItem(R.id.action_set_repeater_debounce_two_minutes).setChecked(true);
-				break;
-		}
-	}
-
-	private void setFancyHeader(boolean newFancyHeader) {
-		if (fancyHeader == newFancyHeader)
-			return;
-		fancyHeader = newFancyHeader;
-		updateFancyHeaderMenu();
-	}
-
-	private void updateFancyHeaderMenu() {
-		if (fancyHeader)
-			menu.findItem(R.id.action_enable_fancy_header).setChecked(true);
-		else
-			menu.findItem(R.id.action_disable_fancy_header).setChecked(true);
-	}
-
-	private void setRepeaterMode(boolean newRepeaterMode) {
-		if (repeaterMode == newRepeaterMode)
-			return;
-		repeaterMode = newRepeaterMode;
-		updateRepeaterModeMenu();
-	}
-
-	private void updateRepeaterModeMenu() {
-		if (repeaterMode)
-			menu.findItem(R.id.action_enable_repeater_mode).setChecked(true);
-		else
-			menu.findItem(R.id.action_disable_repeater_mode).setChecked(true);
 	}
 
 	private void setOutputRate(int newSampleRate) {
@@ -877,10 +749,6 @@ public class MainActivity extends AppCompatActivity {
 		updateRecordChannelMenu();
 		updateAudioSourceMenu();
 		updateNoiseSymbolsMenu();
-		updateRepeaterDelayMenu();
-		updateRepeaterDebounceMenu();
-		updateFancyHeaderMenu();
-		updateRepeaterModeMenu();
 		return true;
 	}
 
@@ -894,10 +762,6 @@ public class MainActivity extends AppCompatActivity {
 		if (id == R.id.action_delete_messages) {
 			if (messages.getCount() > 0)
 				deleteMessages();
-			return true;
-		}
-		if (id == R.id.action_enable_ultrasonic) {
-			enableUltrasonic();
 			return true;
 		}
 		if (id == R.id.action_compose) {
@@ -1003,10 +867,6 @@ public class MainActivity extends AppCompatActivity {
 			}
 			return false;
 		}
-		if (id == R.id.action_show_spectrum) {
-			spectrumAnalyzer();
-			return true;
-		}
 		if (id == R.id.action_edit_call_sign) {
 			editCallSign();
 			return true;
@@ -1039,70 +899,6 @@ public class MainActivity extends AppCompatActivity {
 			setNoiseSymbols(22);
 			return true;
 		}
-		if (id == R.id.action_set_repeater_no_delay) {
-			setRepeaterDelay(0);
-			return true;
-		}
-		if (id == R.id.action_set_repeater_delay_one_second) {
-			setRepeaterDelay(1);
-			return true;
-		}
-		if (id == R.id.action_set_repeater_delay_two_seconds) {
-			setRepeaterDelay(2);
-			return true;
-		}
-		if (id == R.id.action_set_repeater_delay_four_seconds) {
-			setRepeaterDelay(4);
-			return true;
-		}
-		if (id == R.id.action_set_repeater_delay_eight_seconds) {
-			setRepeaterDelay(8);
-			return true;
-		}
-		if (id == R.id.action_set_repeater_allow_bouncing) {
-			setRepeaterDebounce(0);
-			return true;
-		}
-		if (id == R.id.action_set_repeater_debounce_quarter_minute) {
-			setRepeaterDebounce(15);
-			return true;
-		}
-		if (id == R.id.action_set_repeater_debounce_half_minute) {
-			setRepeaterDebounce(30);
-			return true;
-		}
-		if (id == R.id.action_set_repeater_debounce_one_minute) {
-			setRepeaterDebounce(60);
-			return true;
-		}
-		if (id == R.id.action_set_repeater_debounce_two_minutes) {
-			setRepeaterDebounce(120);
-			return true;
-		}
-		if (id == R.id.action_enable_fancy_header) {
-			setFancyHeader(true);
-			return true;
-		}
-		if (id == R.id.action_disable_fancy_header) {
-			setFancyHeader(false);
-			return true;
-		}
-		if (id == R.id.action_enable_repeater_mode) {
-			setRepeaterMode(true);
-			return true;
-		}
-		if (id == R.id.action_disable_repeater_mode) {
-			setRepeaterMode(false);
-			return true;
-		}
-		if (id == R.id.action_enable_night_mode) {
-			AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_YES);
-			return true;
-		}
-		if (id == R.id.action_disable_night_mode) {
-			AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_NO);
-			return true;
-		}
 		if (id == R.id.action_force_quit) {
 			forcedQuit();
 			return true;
@@ -1125,58 +921,29 @@ public class MainActivity extends AppCompatActivity {
 	private void deleteMessages() {
 		AlertDialog.Builder builder = new AlertDialog.Builder(this, R.style.Theme_AlertDialog);
 		builder.setTitle(R.string.delete_messages)
-			.setMessage(R.string.delete_messages_prompt)
-			.setPositiveButton(R.string.delete, (dialog, which) -> {
-				messages.clear();
-				SharedPreferences pref = getPreferences(Context.MODE_PRIVATE);
-				SharedPreferences.Editor editor = pref.edit();
-				for (int i = 0; i < 100; ++i)
-					editor.remove("m" + i);
-				editor.apply();
-			})
-			.setNegativeButton(R.string.cancel, null)
-			.show();
+				.setMessage(R.string.delete_messages_prompt)
+				.setPositiveButton(R.string.delete, (dialog, which) -> {
+					messages.clear();
+					SharedPreferences pref = getPreferences(Context.MODE_PRIVATE);
+					SharedPreferences.Editor editor = pref.edit();
+					for (int i = 0; i < 100; ++i)
+						editor.remove("m" + i);
+					editor.apply();
+				})
+				.setNegativeButton(R.string.cancel, null)
+				.show();
 	}
 
 	private void forcedQuit() {
 		AlertDialog.Builder builder = new AlertDialog.Builder(this, R.style.Theme_AlertDialog);
 		builder.setTitle(R.string.force_quit)
-			.setMessage(R.string.force_quit_prompt)
-			.setPositiveButton(R.string.quit, (dialog, which) -> {
-				storeSettings();
-				System.exit(0);
-			})
-			.setNegativeButton(R.string.cancel, null)
-			.show();
-	}
-
-	private void enableUltrasonic() {
-		AlertDialog.Builder builder = new AlertDialog.Builder(this, R.style.Theme_AlertDialog);
-		builder.setTitle(R.string.enable_ultrasonic)
-			.setMessage(R.string.enable_ultrasonic_prompt)
-			.setPositiveButton(R.string.enable, (dialogInterface, i) -> ultrasonicEnabled = true)
-			.setNegativeButton(R.string.disable, (dialogInterface, i) -> ultrasonicEnabled = false)
-			.show();
-	}
-
-	private void spectrumAnalyzer() {
-		View view = getLayoutInflater().inflate(R.layout.spectrum_analyzer, null);
-		spectrogramView = view.findViewById(R.id.spectrogram);
-		spectrumView = view.findViewById(R.id.spectrum);
-		spectrumBitmap = Bitmap.createBitmap(spectrumWidth, spectrumHeight, Bitmap.Config.ARGB_8888);
-		spectrogramBitmap = Bitmap.createBitmap(spectrogramWidth, spectrogramHeight, Bitmap.Config.ARGB_8888);
-		spectrumView.setImageBitmap(spectrumBitmap);
-		spectrogramView.setImageBitmap(spectrogramBitmap);
-		spectrumPixels = new int[spectrumWidth * spectrumHeight];
-		spectrogramPixels = new int[spectrogramWidth * spectrogramHeight];
-		spectrumTint = ContextCompat.getColor(this, R.color.tint);
-		AlertDialog.Builder builder = new AlertDialog.Builder(this, R.style.Theme_AlertDialog);
-		builder.setTitle(R.string.spectrum_analyzer);
-		builder.setView(view);
-		builder.setNeutralButton(R.string.close, (dialogInterface, i) -> showSpectrum = false);
-		builder.setOnCancelListener(dialogInterface -> showSpectrum = false);
-		builder.show();
-		showSpectrum = true;
+				.setMessage(R.string.force_quit_prompt)
+				.setPositiveButton(R.string.quit, (dialog, which) -> {
+					storeSettings();
+					System.exit(0);
+				})
+				.setNegativeButton(R.string.cancel, null)
+				.show();
 	}
 
 	private void composeMessage(String temp) {
@@ -1211,25 +978,15 @@ public class MainActivity extends AppCompatActivity {
 
 			@Override
 			public void onTextChanged(CharSequence charSequence, int i, int i1, int i2) {
-				int bytes = charSequence.toString().getBytes().length;
-				if (bytes <= 85) {
-					int num = 85 - bytes;
-					left.setText(getResources().getQuantityString(R.plurals.strong_bytes_left, num, num));
+				String text = charSequence.toString();
+				int bytes = text.getBytes(StandardCharsets.UTF_8).length;
+				int estimated = MAX_CHARACTERS - bytes;
+				if (bytes <= MAX_CHARACTERS) {
+					left.setText(getResources().getQuantityString(R.plurals.characters_left, estimated, estimated));
 					left.setTextColor(ContextCompat.getColor(context, R.color.tint));
 					dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(bytes > 0);
-				} else if (bytes <= 128) {
-					int num = 128 - bytes;
-					left.setText(getResources().getQuantityString(R.plurals.medium_bytes_left, num, num));
-					left.setTextColor(ContextCompat.getColor(context, R.color.tint));
-					dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(true);
-				} else if (bytes <= 170) {
-					int num = 170 - bytes;
-					left.setText(getResources().getQuantityString(R.plurals.normal_bytes_left, num, num));
-					left.setTextColor(ContextCompat.getColor(context, R.color.tint));
-					dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(true);
 				} else {
-					int num = bytes - 170;
-					left.setText(getResources().getQuantityString(R.plurals.over_capacity, num, num));
+					left.setText(getResources().getQuantityString(R.plurals.over_capacity, estimated, estimated));
 					left.setTextColor(Color.RED);
 					dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
 				}
@@ -1245,18 +1002,18 @@ public class MainActivity extends AppCompatActivity {
 
 	private void transmitMessage(String message) {
 		stopListening();
-		byte[] mesg = null;
+		byte[] mesg;
 		try {
 			mesg = encryptText(message);
 		} catch (Exception e) {
 			Toast.makeText(this, e.getMessage(), Toast.LENGTH_LONG).show();
 			return;
 		}
-		if (message.length() == 0)
+		if (message.isEmpty())
 			addLine(callSign.trim(), getString(R.string.sent_ping));
 		else
 			addMessage(callSign.trim(), getString(R.string.transmitted), message);
-		configureEncoder(mesg, callTerm(), carrierFrequency, noiseSymbols, fancyHeader);
+		configureEncoder(mesg, callTerm(), carrierFrequency, noiseSymbols, false);
 		for (int i = 0; i < 5; ++i) {
 			produceEncoder(outputBuffer, outputChannel);
 			audioTrack.write(outputBuffer, 0, outputBuffer.length);
@@ -1265,33 +1022,12 @@ public class MainActivity extends AppCompatActivity {
 		setStatus(getString(R.string.transmitting));
 	}
 
-	private void repeatMessage() {
-		Message message = new Message(stagedCall, payload);
-		Iterator<Message> iterator = repeatedMessages.iterator();
-		while (iterator.hasNext()) {
-			Message repeated = iterator.next();
-			if (message.time - repeated.time < repeaterDebounce) {
-				if (Arrays.equals(repeated.call, message.call) && Arrays.equals(repeated.data, message.data)) {
-					setStatus(getString(R.string.ignoring), true);
-					return;
-				}
-			} else {
-				iterator.remove();
-			}
-		}
-		if (repeaterDebounce > 0)
-			repeatedMessages.add(message);
-		stopListening();
-		addMessage(new String(stagedCall).trim(), getString(R.string.repeated), new String(payload).trim());
-		configureEncoder(payload, stagedCall, carrierFrequency, noiseSymbols, fancyHeader);
-		for (int i = 0; i < 5; ++i) {
-			produceEncoder(outputBuffer, outputChannel);
-			audioTrack.write(outputBuffer, 0, outputBuffer.length);
-		}
-		handler.postDelayed(() -> {
-			audioTrack.play();
-			setStatus(getString(R.string.transmitting));
-		}, 1000L * repeaterDelay);
+	private String[] carrierValues(int minCarrierFrequency, int maxCarrierFrequency) {
+		int count = (maxCarrierFrequency - minCarrierFrequency) / 50 + 1;
+		String[] values = new String[count];
+		for (int i = 0; i < count; ++i)
+			values[i] = String.format(Locale.US, "%d", i * 50 + minCarrierFrequency);
+		return values;
 	}
 
 	private void setInputType(ViewGroup np, int it) {
@@ -1308,19 +1044,10 @@ public class MainActivity extends AppCompatActivity {
 		}
 	}
 
-	private String[] carrierValues(int minCarrierFrequency, int maxCarrierFrequency) {
-		int count = (maxCarrierFrequency - minCarrierFrequency) / 50 + 1;
-		String[] values = new String[count];
-		for (int i = 0; i < count; ++i)
-			values[i] = String.format(Locale.US, "%d", i * 50 + minCarrierFrequency);
-		return values;
-	}
-
 	private void setCarrierFrequency() {
 		View view = getLayoutInflater().inflate(R.layout.carrier_frequency, null);
 		NumberPicker picker = view.findViewById(R.id.carrier);
-		int bandWidth = 1600;
-		int maxCarrierFrequency = ultrasonicEnabled ? (outputRate - bandWidth) / 2 : 3000;
+		int maxCarrierFrequency = 3000;
 		int minCarrierFrequency = outputChannel == 4 ? -maxCarrierFrequency : 1000;
 		if (carrierFrequency < minCarrierFrequency || carrierFrequency > maxCarrierFrequency)
 			carrierFrequency = 1500;
@@ -1337,6 +1064,7 @@ public class MainActivity extends AppCompatActivity {
 		builder.setPositiveButton(R.string.okay, (dialogInterface, i) -> carrierFrequency = picker.getValue() * 50 + minCarrierFrequency);
 		builder.show();
 	}
+
 
 	private void editCallSign() {
 		View view = getLayoutInflater().inflate(R.layout.call_sign, null);
